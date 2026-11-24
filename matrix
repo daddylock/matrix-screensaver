@@ -1,0 +1,164 @@
+#!/bin/bash
+set -u
+
+# ==========================================
+# Configuration
+# ==========================================
+VIEW_TIME=10        # Time (in seconds) to enjoy the matrix before shutdown
+FADE_STEPS=30       # Number of steps for the fade out
+FADE_DELAY=0.5      # Delay between fade steps
+
+# Dependency mapping: [command]="apt_package"
+declare -A DEPS=(
+    ["cmatrix"]="cmatrix"
+    ["lolcat"]="lolcat"
+    ["xterm"]="xterm"
+    ["wmctrl"]="wmctrl"
+    ["unclutter"]="unclutter"
+    ["xdotool"]="xdotool"
+    ["xrandr"]="x11-xserver-utils"
+)
+
+# ==========================================
+# Helper Functions
+# ==========================================
+log_info() { echo -e "\e[32m[*]\e[0m $1"; }
+log_success() { echo -e "\e[34m[+]\e[0m $1"; }
+log_warn() { echo -e "\e[33m[!]\e[0m $1"; }
+log_err() { echo -e "\e[31m[-]\e[0m $1"; }
+
+check_and_install_dependencies() {
+    log_info "Checking system dependencies..."
+    local missing_pkgs=()
+    
+    for cmd in "${!DEPS[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_pkgs+=("${DEPS[$cmd]}")
+        fi
+    done
+
+    if [ ${#missing_pkgs[@]} -gt 0 ]; then
+        log_warn "Missing dependencies detected: ${missing_pkgs[*]}"
+        read -p "Do you want to install them automatically via apt? [Y/n] " answer
+        if [[ "$answer" =~ ^[Yy]$ ]] || [ -z "$answer" ]; then
+            log_info "Installing missing packages. You may be prompted for your password."
+            sudo apt update && sudo apt install -y "${missing_pkgs[@]}"
+            if [ $? -ne 0 ]; then
+                log_err "Installation failed. Please install manually."
+                exit 1
+            fi
+        else
+            log_err "Cannot proceed without dependencies. Exiting."
+            exit 1
+        fi
+    fi
+    log_success "All dependencies are satisfied."
+}
+
+get_monitors() {
+    # Outputs: "name X Y" for each monitor
+    xrandr --listmonitors | grep -E '^\s+[0-9]+:' | while read -r line; do
+        local mon_name
+        mon_name=$(echo "$line" | awk '{print $4}')
+        if [ -z "$mon_name" ]; then
+            mon_name=$(echo "$line" | awk '{print $2}' | sed 's/^[+*]*//')
+        fi
+        local geom_raw
+        geom_raw=$(echo "$line" | awk '{print $3}')
+        local x y
+        x=$(echo "$geom_raw" | cut -d'+' -f2)
+        y=$(echo "$geom_raw" | cut -d'+' -f3)
+        echo "$mon_name $x $y"
+    done
+}
+
+cleanup() {
+    log_warn "Interrupt received. Closing matrix instances..."
+    if [ ${#monitors[@]} -gt 0 ]; then
+        while read -r mon_name _ _; do
+            wmctrl -c "cmatrix-$mon_name" 2>/dev/null
+        done <<< "$(printf "%s\n" "${monitors[@]}")"
+    fi
+    log_info "Goodbye."
+    exit 0
+}
+
+# ==========================================
+# Execution
+# ==========================================
+clear
+log_info "Initializing matrix screensaver..."
+
+# 1. Check dependencies
+check_and_install_dependencies
+
+# 2. Ask for shutdown preference
+read -p "$(echo -e "\e[36m[?]\e[0m Do you want to shutdown the PC after the screensaver? [y/N] ")" SHUTDOWN_CHOICE
+if [[ "$SHUTDOWN_CHOICE" =~ ^[Yy]$ ]]; then
+    DO_SHUTDOWN=true
+else
+    DO_SHUTDOWN=false
+fi
+
+# 3. Detect monitors
+log_info "Detecting connected monitors..."
+readarray -t monitors < <(get_monitors)
+log_success "Found ${#monitors[@]} monitor(s)."
+
+# Trap SIGINT (Ctrl+C) to cleanly close windows
+trap cleanup SIGINT SIGTERM
+
+# 4. Launch matrix
+log_info "Launching matrix instances..."
+while read -r mon_name x y; do
+    echo "    -> Initializing cmatrix on $mon_name at coordinates +$x+$y"
+    xterm -title "cmatrix-$mon_name" \
+          -geometry +$x+$y \
+          -e "bash -c 'cmatrix | lolcat -f'" &
+done <<< "$(printf "%s\n" "${monitors[@]}")"
+
+log_info "Waiting for window manager to settle..."
+sleep 2
+
+log_info "Applying fullscreen mode..."
+while read -r mon_name x y; do
+    wmctrl -r "cmatrix-$mon_name" -b add,fullscreen
+    echo "    -> Window on $mon_name maximized."
+done <<< "$(printf "%s\n" "${monitors[@]}")"
+
+# 5. Branch based on user choice
+if [ "$DO_SHUTDOWN" = true ]; then
+    log_success "Matrix is running. Shutdown sequence initiated in $VIEW_TIME seconds."
+    
+    # Hide mouse
+    log_info "Hiding mouse cursor..."
+    unclutter -idle 0 -root &
+    UNCLUTTER_PID=$!
+    xdotool mousemove 5000 5000
+    
+    sleep "$VIEW_TIME"
+    
+    # Fade to black
+    log_info "Initiating smooth fade to black ($FADE_STEPS steps)..."
+    for ((i = FADE_STEPS; i >= 0; i--)); do
+        brightness=$(awk -v i="$i" -v steps="$FADE_STEPS" 'BEGIN {printf "%.2f", i/steps}')
+        echo "    -> Adjusting brightness to: $brightness"
+        while read -r mon_name _ _; do
+            xrandr --output "$mon_name" --brightness "$brightness"
+        done <<< "$(printf "%s\n" "${monitors[@]}")"
+        sleep "$FADE_DELAY"
+    done
+    
+    log_info "Screen is completely dark. Preparing to shutdown..."
+    kill $UNCLUTTER_PID 2>/dev/null
+    sleep 3
+    log_info "Powering off the system. Good night!"
+    systemctl poweroff
+else
+    log_success "Screensaver is running. Press Ctrl+C in this terminal to stop."
+    echo "--------------------------------------------------------"
+    # Keep the script running indefinitely
+    while true; do
+        sleep 1
+    done
+fi

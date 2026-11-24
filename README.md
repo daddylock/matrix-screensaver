@@ -1,4 +1,5 @@
 # Matrix Screensaver for Linux (Multi-Monitor)
+Note: Currently tested on Debian-based distributions (Ubuntu, Linux Mint). The auto-installer relies on apt
 
 A non professional, multi-monitor matrix screensaver for Linux (X11). 
 It features optional smooth fade-to-black and automatic shutdown.
